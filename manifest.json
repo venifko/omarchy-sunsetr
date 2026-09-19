@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "venifko.sunsetr",
+  "name": "Sunsetr",
+  "version": "0.1.0",
+  "author": "venifko",
+  "license": "MIT",
+  "description": "Automatic daylight and night-light controls for sunsetr",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Sunsetr",
+    "description": "Control automatic screen colour temperature and tune daylight, evening, bedtime, and neutral presets",
+    "category": "System",
+    "defaultSection": "right",
+    "aliases": ["nightlight", "daylight", "flux", "screen temperature"],
+    "allowMultiple": false
+  }
+}

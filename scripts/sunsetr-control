@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""Small JSON interface between the Omarchy widget and sunsetr."""
+
+from __future__ import annotations
+
+import json
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+import tomllib
+from typing import Any
+
+
+CONFIG_HOME = pathlib.Path(os.environ.get("XDG_CONFIG_HOME", pathlib.Path.home() / ".config"))
+SUNSETR_DIR = CONFIG_HOME / "sunsetr"
+
+TARGETS: dict[str, tuple[tuple[str, str], ...]] = {
+    "daylight": (("default", "day_temp"), ("morning", "day_temp")),
+    "evening": (("default", "night_temp"), ("bedtime", "day_temp")),
+    "bedtime": (("bedtime", "night_temp"), ("morning", "night_temp")),
+    "neutral": (("neutral", "static_temp"),),
+}
+
+
+def run(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(args, check=check, text=True, capture_output=True)
+
+
+def sunsetr(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    binary = shutil.which("sunsetr") or "/usr/bin/sunsetr"
+    return run(binary, *args, check=check)
+
+
+def preset_file(name: str) -> pathlib.Path:
+    if name == "default":
+        return SUNSETR_DIR / "sunsetr.toml"
+    return SUNSETR_DIR / "presets" / name / "sunsetr.toml"
+
+
+def read_toml(name: str) -> dict[str, Any]:
+    path = preset_file(name)
+    try:
+        with path.open("rb") as handle:
+            return tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+
+
+def active_preset() -> str:
+    result = sunsetr("preset", "active", check=False)
+    return result.stdout.strip() if result.returncode == 0 else "unknown"
+
+
+def scheduled_preset() -> str:
+    selector = SUNSETR_DIR / "select-schedule"
+    if not selector.is_file():
+        return "default"
+    result = run(str(selector), "--show", check=False)
+    return result.stdout.strip() if result.returncode == 0 else "unknown"
+
+
+def is_running() -> bool:
+    return run("pgrep", "-x", "sunsetr", check=False).returncode == 0
+
+
+def runtime_status() -> dict[str, Any]:
+    if not is_running():
+        return {}
+    result = sunsetr("status", "--json", check=False)
+    if result.returncode != 0:
+        return {}
+    try:
+        value = json.loads(result.stdout)
+        return value if isinstance(value, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def find_number(value: Any, names: set[str]) -> int | None:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key.lower() in names and isinstance(child, (int, float)):
+                return round(child)
+        for child in value.values():
+            found = find_number(child, names)
+            if found is not None:
+                return found
+    return None
+
+
+def state() -> dict[str, Any]:
+    runtime = runtime_status()
+    default = read_toml("default")
+    bedtime = read_toml("bedtime")
+    neutral = read_toml("neutral")
+    active = active_preset()
+    current_temp = find_number(runtime, {"temperature", "temp", "current_temp"})
+    current_gamma = find_number(runtime, {"gamma", "current_gamma"})
+    return {
+        "available": shutil.which("sunsetr") is not None,
+        "running": is_running(),
+        "activePreset": active,
+        "automatic": active != "neutral",
+        "scheduledPreset": scheduled_preset(),
+        "temperature": current_temp,
+        "gamma": current_gamma,
+        "daylightTemp": int(default.get("day_temp", 6500)),
+        "eveningTemp": int(default.get("night_temp", 4000)),
+        "bedtimeTemp": int(bedtime.get("night_temp", 2800)),
+        "neutralTemp": int(neutral.get("static_temp", 6500)),
+        "error": "" if is_running() else "sunsetr is not running",
+    }
+
+
+def apply_active() -> None:
+    active = active_preset()
+    if active not in {"", "unknown"}:
+        sunsetr("preset", active)
+
+
+def set_temperature(kind: str, value: int) -> None:
+    if kind not in TARGETS:
+        raise ValueError(f"unknown temperature kind: {kind}")
+    if not 1000 <= value <= 10000:
+        raise ValueError("temperature must be between 1000 and 10000 K")
+    for target, field in TARGETS[kind]:
+        sunsetr("set", "--target", target, f"{field}={value}")
+    apply_active()
+
+
+def print_state() -> None:
+    print(json.dumps(state(), separators=(",", ":")))
+
+
+def main(argv: list[str]) -> int:
+    try:
+        command = argv[1] if len(argv) > 1 else "status"
+        if command == "status":
+            print_state()
+            return 0
+        if command == "mode" and len(argv) == 3:
+            if argv[2] == "neutral":
+                sunsetr("preset", "neutral")
+            elif argv[2] == "auto":
+                sunsetr("preset", "default")
+                selector = SUNSETR_DIR / "select-schedule"
+                if selector.is_file():
+                    run(str(selector))
+            else:
+                raise ValueError("mode must be auto or neutral")
+            print_state()
+            return 0
+        if command == "set-temp" and len(argv) == 4:
+            set_temperature(argv[2], int(argv[3]))
+            print_state()
+            return 0
+        raise ValueError("usage: sunsetr-control status | mode auto|neutral | set-temp KIND KELVIN")
+    except (ValueError, OSError, subprocess.CalledProcessError) as error:
+        print(json.dumps({"error": str(error)}, separators=(",", ":")))
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))
