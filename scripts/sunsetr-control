@@ -1,27 +1,34 @@
 #!/usr/bin/env python3
-"""Small JSON interface between the Omarchy widget and sunsetr."""
+"""Flux-like schedule and policy controller for the Omarchy Sunsetr widget."""
 
 from __future__ import annotations
 
+import datetime as dt
 import json
+import math
 import os
 import pathlib
-import re
 import shutil
 import subprocess
 import sys
-import tomllib
+import time
 from typing import Any
-
 
 CONFIG_HOME = pathlib.Path(os.environ.get("XDG_CONFIG_HOME", pathlib.Path.home() / ".config"))
 SUNSETR_DIR = CONFIG_HOME / "sunsetr"
+CONTROL_DIR = CONFIG_HOME / "omarchy-sunsetr"
+SETTINGS_FILE = CONTROL_DIR / "settings.json"
+RUNTIME_PRESET = SUNSETR_DIR / "presets" / "omarchy-circadian" / "sunsetr.toml"
 
-TARGETS: dict[str, tuple[tuple[str, str], ...]] = {
-    "daylight": (("default", "day_temp"), ("morning", "day_temp")),
-    "evening": (("default", "night_temp"), ("bedtime", "day_temp")),
-    "bedtime": (("bedtime", "night_temp"), ("morning", "night_temp")),
-    "neutral": (("neutral", "static_temp"),),
+DEFAULTS: dict[str, Any] = {
+    "enabled": True, "mode": "auto", "scheduleMode": "solar",
+    "wakeTime": "06:30", "sleepTime": "22:30", "eveningTime": "18:30",
+    "windDownMinutes": 120, "transitionMinutes": 60,
+    "latitude": 49.3961, "longitude": 15.5912,
+    "daylightTemp": 6500, "eveningTemp": 4000, "bedtimeTemp": 2800,
+    "neutralTemp": 6500, "manualTemp": 4500,
+    "disableFullscreen": False, "excludedApps": [], "disabledOutputs": [],
+    "disabledUntil": 0,
 }
 
 
@@ -30,138 +37,271 @@ def run(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
 
 
 def sunsetr(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-    binary = shutil.which("sunsetr") or "/usr/bin/sunsetr"
-    return run(binary, *args, check=check)
+    return run(shutil.which("sunsetr") or "/usr/bin/sunsetr", *args, check=check)
 
 
-def preset_file(name: str) -> pathlib.Path:
-    if name == "default":
-        return SUNSETR_DIR / "sunsetr.toml"
-    return SUNSETR_DIR / "presets" / name / "sunsetr.toml"
-
-
-def read_toml(name: str) -> dict[str, Any]:
-    path = preset_file(name)
+def load_settings() -> dict[str, Any]:
+    values = dict(DEFAULTS)
     try:
-        with path.open("rb") as handle:
-            return tomllib.load(handle)
-    except (OSError, tomllib.TOMLDecodeError):
-        return {}
+        stored = json.loads(SETTINGS_FILE.read_text())
+        if isinstance(stored, dict): values.update(stored)
+    except (OSError, json.JSONDecodeError):
+        pass
+    values["excludedApps"] = sorted({str(v).lower() for v in values["excludedApps"] if str(v)})
+    values["disabledOutputs"] = sorted({str(v) for v in values["disabledOutputs"] if str(v)})
+    return values
 
 
-def active_preset() -> str:
-    result = sunsetr("preset", "active", check=False)
-    return result.stdout.strip() if result.returncode == 0 else "unknown"
+def save_settings(values: dict[str, Any]) -> None:
+    CONTROL_DIR.mkdir(parents=True, exist_ok=True)
+    temporary = SETTINGS_FILE.with_suffix(".tmp")
+    temporary.write_text(json.dumps(values, indent=2, sort_keys=True) + "\n")
+    temporary.replace(SETTINGS_FILE)
 
 
-def scheduled_preset() -> str:
-    selector = SUNSETR_DIR / "select-schedule"
-    if not selector.is_file():
-        return "default"
-    result = run(str(selector), "--show", check=False)
-    return result.stdout.strip() if result.returncode == 0 else "unknown"
+def parse_clock(value: str) -> int:
+    try: hour, minute = (int(part) for part in value.split(":"))
+    except (ValueError, AttributeError): raise ValueError("time must use HH:MM") from None
+    if not 0 <= hour <= 23 or not 0 <= minute <= 59: raise ValueError("time must use HH:MM")
+    return hour * 60 + minute
+
+
+def clock_label(minutes: float) -> str:
+    value = round(minutes) % 1440
+    return f"{value // 60:02d}:{value % 60:02d}"
+
+
+def smooth(start: int, end: int, progress: float) -> int:
+    progress = max(0.0, min(1.0, progress))
+    eased = (1 - math.cos(math.pi * progress)) / 2
+    return round(start + (end - start) * eased)
+
+
+def solar_event(date: dt.date, latitude: float, longitude: float, sunset: bool,
+                utc_offset_hours: float) -> int | None:
+    """NOAA sunrise equation, returned as local minutes after midnight."""
+    day = date.timetuple().tm_yday
+    lng_hour = longitude / 15.0
+    estimate = day + ((18 if sunset else 6) - lng_hour) / 24
+    anomaly = 0.9856 * estimate - 3.289
+    longitude_sun = (anomaly + 1.916 * math.sin(math.radians(anomaly))
+                     + 0.020 * math.sin(math.radians(2 * anomaly)) + 282.634) % 360
+    ascension = math.degrees(math.atan(0.91764 * math.tan(math.radians(longitude_sun)))) % 360
+    ascension += math.floor(longitude_sun / 90) * 90 - math.floor(ascension / 90) * 90
+    ascension /= 15
+    sin_declination = 0.39782 * math.sin(math.radians(longitude_sun))
+    cos_declination = math.cos(math.asin(sin_declination))
+    cos_hour = ((math.cos(math.radians(90.833))
+                 - sin_declination * math.sin(math.radians(latitude)))
+                / (cos_declination * math.cos(math.radians(latitude))))
+    if not -1 <= cos_hour <= 1: return None
+    hour_angle = math.degrees(math.acos(cos_hour))
+    if not sunset: hour_angle = 360 - hour_angle
+    local_hour = ((hour_angle / 15 + ascension - 0.06571 * estimate - 6.622
+                   - lng_hour + utc_offset_hours) % 24)
+    return round(local_hour * 60) % 1440
+
+
+def schedule(values: dict[str, Any], now: dt.datetime | None = None) -> dict[str, Any]:
+    now = now or dt.datetime.now().astimezone()
+    wake, sleep = parse_clock(values["wakeTime"]), parse_clock(values["sleepTime"])
+    sleep_rel = (sleep - wake) % 1440 or 1440
+    transition = max(5, min(180, int(values["transitionMinutes"])))
+    wind_down = max(30, min(360, int(values["windDownMinutes"])))
+    bedtime_start = max(transition, sleep_rel - wind_down)
+    if values["scheduleMode"] == "solar":
+        offset = (now.utcoffset() or dt.timedelta()).total_seconds() / 3600
+        evening = solar_event(now.date(), float(values["latitude"]), float(values["longitude"]), True, offset)
+        if evening is None: evening = parse_clock(values["eveningTime"])
+    else:
+        evening = parse_clock(values["eveningTime"])
+    evening_rel = max(transition, min((evening - wake) % 1440,
+                                     max(transition, bedtime_start - transition)))
+    current = (now.hour * 60 + now.minute + now.second / 60 - wake) % 1440
+    day, eve, bed = (int(values[k]) for k in ("daylightTemp", "eveningTemp", "bedtimeTemp"))
+    if current < transition:
+        phase, temperature, next_at, next_phase = "waking", smooth(bed, day, current / transition), transition, "daylight"
+    elif current < evening_rel:
+        phase, temperature, next_at, next_phase = "daylight", day, evening_rel, "sunset"
+    elif current < evening_rel + transition:
+        phase = "sunset"
+        temperature = smooth(day, eve, (current - evening_rel) / transition)
+        next_at, next_phase = evening_rel + transition, "evening"
+    elif current < bedtime_start:
+        phase, temperature, next_at, next_phase = "evening", eve, bedtime_start, "wind-down"
+    elif current < sleep_rel:
+        phase = "wind-down"
+        temperature = smooth(eve, bed, (current - bedtime_start) / max(1, sleep_rel - bedtime_start))
+        next_at, next_phase = sleep_rel, "sleep"
+    else:
+        phase, temperature, next_at, next_phase = "sleep", bed, 1440, "waking"
+    return {"phase": phase, "temperature": temperature, "nextPhase": next_phase,
+            "nextTransition": clock_label(wake + next_at), "sunsetTime": clock_label(wake + evening_rel)}
+
+
+def active_window() -> dict[str, Any]:
+    result = run("hyprctl", "-j", "activewindow", check=False)
+    try: window = json.loads(result.stdout) if result.returncode == 0 else {}
+    except json.JSONDecodeError: window = {}
+    return {"class": str(window.get("class", "")), "title": str(window.get("title", "")),
+            "fullscreen": int(window.get("fullscreen", 0) or 0) > 0,
+            "monitor": int(window.get("monitor", -1) or -1)}
+
+
+def monitors() -> list[dict[str, Any]]:
+    result = run("hyprctl", "-j", "monitors", "all", check=False)
+    try: items = json.loads(result.stdout) if result.returncode == 0 else []
+    except json.JSONDecodeError: items = []
+    return [{"id": int(item.get("id", -1)), "name": str(item.get("name", "")),
+             "description": str(item.get("description", ""))}
+            for item in items if not item.get("disabled")]
+
+
+def override_reason(values: dict[str, Any], window: dict[str, Any], now: float) -> str:
+    if not values["enabled"]: return "off"
+    disabled_until = float(values.get("disabledUntil", 0) or 0)
+    if disabled_until > now: return "temporary"
+    elif disabled_until:
+        values["disabledUntil"] = 0; save_settings(values)
+    if values["disableFullscreen"] and window["fullscreen"]: return "fullscreen"
+    if window["class"].lower() in values["excludedApps"]: return f"app: {window['class']}"
+    return ""
+
+
+def desired(values: dict[str, Any], now: dt.datetime | None = None,
+            window: dict[str, Any] | None = None) -> dict[str, Any]:
+    now = now or dt.datetime.now().astimezone(); window = window or active_window()
+    planned = schedule(values, now); reason = override_reason(values, window, now.timestamp())
+    if reason or values["mode"] == "neutral":
+        return {**planned, "temperature": int(values["neutralTemp"]),
+                "effectiveMode": "disabled" if reason else "neutral", "overrideReason": reason}
+    if values["mode"] == "manual":
+        return {**planned, "temperature": int(values["manualTemp"]),
+                "effectiveMode": "manual", "overrideReason": ""}
+    return {**planned, "effectiveMode": "auto", "overrideReason": ""}
 
 
 def is_running() -> bool:
     return run("pgrep", "-x", "sunsetr", check=False).returncode == 0
 
 
-def runtime_status() -> dict[str, Any]:
-    if not is_running():
-        return {}
-    result = sunsetr("status", "--json", check=False)
-    if result.returncode != 0:
-        return {}
-    try:
-        value = json.loads(result.stdout)
-        return value if isinstance(value, dict) else {}
-    except json.JSONDecodeError:
-        return {}
+def relay_running() -> bool:
+    return run("busctl", "--user", "status", "rs.wl-gammarelay", check=False).returncode == 0
 
 
-def find_number(value: Any, names: set[str]) -> int | None:
-    if isinstance(value, dict):
-        for key, child in value.items():
-            if key.lower() in names and isinstance(child, (int, float)):
-                return round(child)
-        for child in value.values():
-            found = find_number(child, names)
-            if found is not None:
-                return found
-    return None
+def relay_path(output_name: str) -> str:
+    safe = "".join(character if character.isalnum() else "_" for character in output_name)
+    return f"/outputs/{safe}"
 
 
-def state() -> dict[str, Any]:
-    runtime = runtime_status()
-    default = read_toml("default")
-    bedtime = read_toml("bedtime")
-    neutral = read_toml("neutral")
-    active = active_preset()
-    current_temp = find_number(runtime, {"temperature", "temp", "current_temp"})
-    current_gamma = find_number(runtime, {"gamma", "current_gamma"})
-    return {
-        "available": shutil.which("sunsetr") is not None,
-        "running": is_running(),
-        "activePreset": active,
-        "automatic": active != "neutral",
-        "scheduledPreset": scheduled_preset(),
-        "temperature": current_temp,
-        "gamma": current_gamma,
-        "daylightTemp": int(default.get("day_temp", 6500)),
-        "eveningTemp": int(default.get("night_temp", 4000)),
-        "bedtimeTemp": int(bedtime.get("night_temp", 2800)),
-        "neutralTemp": int(neutral.get("static_temp", 6500)),
-        "error": "" if is_running() else "sunsetr is not running",
-    }
+def apply_relay(temperature: int, values: dict[str, Any], output_list: list[dict[str, Any]]) -> str:
+    errors = []
+    disabled = set(values["disabledOutputs"])
+    for output in output_list:
+        target = int(values["neutralTemp"]) if output["name"] in disabled else temperature
+        result = run("busctl", "--user", "set-property", "rs.wl-gammarelay",
+                     relay_path(output["name"]), "rs.wl.gammarelay", "Temperature", "q",
+                     str(target), check=False)
+        if result.returncode != 0: errors.append(result.stderr.strip() or output["name"])
+    return "; ".join(errors)
 
 
-def apply_active() -> None:
-    active = active_preset()
-    if active not in {"", "unknown"}:
-        sunsetr("preset", active)
+def ensure_runtime_preset(temperature: int) -> bool:
+    RUNTIME_PRESET.parent.mkdir(parents=True, exist_ok=True)
+    content = ("backend = \"hyprsunset\"\ntransition_mode = \"static\"\n"
+               f"static_temp = {temperature}\nstatic_gamma = 100\n"
+               "smoothing = true\nstartup_duration = 1.0\nshutdown_duration = 0.5\n")
+    if not RUNTIME_PRESET.exists() or RUNTIME_PRESET.read_text() != content:
+        temporary = RUNTIME_PRESET.with_suffix(".tmp"); temporary.write_text(content); temporary.replace(RUNTIME_PRESET)
+        return True
+    return False
 
 
-def set_temperature(kind: str, value: int) -> None:
-    if kind not in TARGETS:
-        raise ValueError(f"unknown temperature kind: {kind}")
-    if not 1000 <= value <= 10000:
-        raise ValueError("temperature must be between 1000 and 10000 K")
-    for target, field in TARGETS[kind]:
-        sunsetr("set", "--target", target, f"{field}={value}")
-    apply_active()
+def apply_temperature(temperature: int, values: dict[str, Any], output_list: list[dict[str, Any]]) -> str:
+    if relay_running(): return apply_relay(temperature, values, output_list)
+    if not is_running(): return "sunsetr is not running"
+    changed = ensure_runtime_preset(temperature)
+    active = sunsetr("preset", "active", check=False).stdout.strip()
+    if active == "omarchy-circadian" and not changed: return ""
+    result = sunsetr("preset", "omarchy-circadian", check=False)
+    return "" if result.returncode == 0 else (result.stderr.strip() or "sunsetr command failed")
 
 
-def print_state() -> None:
-    print(json.dumps(state(), separators=(",", ":")))
+def build_state(apply: bool = False) -> dict[str, Any]:
+    values = load_settings(); window = active_window(); planned = desired(values, window=window)
+    output_list = monitors(); relay = relay_running()
+    error = apply_temperature(planned["temperature"], values, output_list) if apply else ""
+    return {**values, **planned, "available": relay or shutil.which("sunsetr") is not None,
+            "running": relay or is_running(), "activeApp": window["class"], "activeTitle": window["title"],
+            "activeFullscreen": window["fullscreen"], "monitors": output_list,
+            "perDisplayAvailable": relay,
+            "backend": "wl-gammarelay · per display" if relay else "sunsetr · all displays",
+            "error": error}
+
+
+def validate_setting(key: str, value: Any) -> Any:
+    if key in {"wakeTime", "sleepTime", "eveningTime"}: parse_clock(str(value)); return str(value)
+    if key in {"daylightTemp", "eveningTemp", "bedtimeTemp", "neutralTemp", "manualTemp"}:
+        number = int(value)
+        if not 1000 <= number <= 10000: raise ValueError("temperature must be 1000–10000 K")
+        return number
+    if key == "latitude":
+        number = float(value)
+        if not -90 <= number <= 90: raise ValueError("latitude must be -90–90")
+        return number
+    if key == "longitude":
+        number = float(value)
+        if not -180 <= number <= 180: raise ValueError("longitude must be -180–180")
+        return number
+    if key in {"transitionMinutes", "windDownMinutes"}: return int(value)
+    if key in {"disableFullscreen", "enabled"}: return value in {True, "true", "1", 1}
+    if key == "scheduleMode" and value in {"solar", "clock"}: return value
+    if key == "mode" and value in {"auto", "manual", "neutral"}: return value
+    raise ValueError(f"unsupported setting: {key}")
+
+
+def dispatch(argv: list[str]) -> dict[str, Any]:
+    values = load_settings(); command = argv[0] if argv else "status"
+    if command == "status": return build_state(False)
+    if command == "reconcile": return build_state(True)
+    if command == "set-schedule" and len(argv) == 3:
+        values["wakeTime"] = validate_setting("wakeTime", argv[1])
+        values["sleepTime"] = validate_setting("sleepTime", argv[2]); save_settings(values)
+    elif command == "set-location" and len(argv) == 3:
+        values["latitude"] = validate_setting("latitude", argv[1])
+        values["longitude"] = validate_setting("longitude", argv[2]); save_settings(values)
+    elif command == "set" and len(argv) == 3:
+        values[argv[1]] = validate_setting(argv[1], argv[2]); save_settings(values)
+    elif command == "mode" and len(argv) == 2:
+        values["mode"] = validate_setting("mode", argv[1]); values["disabledUntil"] = 0; save_settings(values)
+    elif command == "disable" and len(argv) == 2:
+        if argv[1] == "clear": values["disabledUntil"] = 0
+        elif argv[1] == "wake":
+            now = dt.datetime.now().astimezone(); wake = parse_clock(values["wakeTime"])
+            target = now.replace(hour=wake // 60, minute=wake % 60, second=0, microsecond=0)
+            if target <= now: target += dt.timedelta(days=1)
+            values["disabledUntil"] = target.timestamp()
+        else: values["disabledUntil"] = time.time() + int(argv[1])
+        save_settings(values)
+    elif command == "toggle-app":
+        app = active_window()["class"].lower()
+        if app:
+            excluded = set(values["excludedApps"]); excluded.remove(app) if app in excluded else excluded.add(app)
+            values["excludedApps"] = sorted(excluded); save_settings(values)
+    elif command == "remove-app" and len(argv) == 2:
+        values["excludedApps"] = [v for v in values["excludedApps"] if v != argv[1].lower()]; save_settings(values)
+    elif command == "toggle-output" and len(argv) == 2:
+        outputs = set(values["disabledOutputs"]); outputs.remove(argv[1]) if argv[1] in outputs else outputs.add(argv[1])
+        values["disabledOutputs"] = sorted(outputs); save_settings(values)
+    else: raise ValueError("invalid command")
+    return build_state(True)
 
 
 def main(argv: list[str]) -> int:
     try:
-        command = argv[1] if len(argv) > 1 else "status"
-        if command == "status":
-            print_state()
-            return 0
-        if command == "mode" and len(argv) == 3:
-            if argv[2] == "neutral":
-                sunsetr("preset", "neutral")
-            elif argv[2] == "auto":
-                sunsetr("preset", "default")
-                selector = SUNSETR_DIR / "select-schedule"
-                if selector.is_file():
-                    run(str(selector))
-            else:
-                raise ValueError("mode must be auto or neutral")
-            print_state()
-            return 0
-        if command == "set-temp" and len(argv) == 4:
-            set_temperature(argv[2], int(argv[3]))
-            print_state()
-            return 0
-        raise ValueError("usage: sunsetr-control status | mode auto|neutral | set-temp KIND KELVIN")
+        print(json.dumps(dispatch(argv[1:]), separators=(",", ":")), flush=True); return 0
     except (ValueError, OSError, subprocess.CalledProcessError) as error:
-        print(json.dumps({"error": str(error)}, separators=(",", ":")))
-        return 1
+        print(json.dumps({"error": str(error)}, separators=(",", ":")), flush=True); return 1
 
 
-if __name__ == "__main__":
-    raise SystemExit(main(sys.argv))
+if __name__ == "__main__": raise SystemExit(main(sys.argv))

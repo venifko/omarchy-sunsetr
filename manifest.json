@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "venifko.sunsetr",
   "name": "Sunsetr",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "venifko",
   "license": "MIT",
   "description": "Automatic daylight and night-light controls for sunsetr",

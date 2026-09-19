@@ -1,8 +1,8 @@
+import datetime as dt
 import importlib.machinery
 import importlib.util
 import pathlib
 import unittest
-from unittest import mock
 
 
 SCRIPT = pathlib.Path(__file__).parents[1] / "scripts" / "sunsetr-control"
@@ -13,32 +13,57 @@ loader.exec_module(control)
 
 
 class SunsetrControlTests(unittest.TestCase):
-    def test_temperature_targets_keep_profiles_consistent(self):
-        self.assertEqual(
-            control.TARGETS["bedtime"],
-            (("bedtime", "night_temp"), ("morning", "night_temp")),
-        )
+    def settings(self):
+        values = dict(control.DEFAULTS)
+        values.update({"scheduleMode": "clock", "wakeTime": "06:30",
+                       "sleepTime": "22:30", "eveningTime": "18:30"})
+        return values
 
-    @mock.patch.object(control, "apply_active")
-    @mock.patch.object(control, "sunsetr")
-    def test_sets_every_linked_target(self, sunsetr, apply_active):
-        control.set_temperature("evening", 3750)
-        self.assertEqual(
-            sunsetr.call_args_list,
-            [
-                mock.call("set", "--target", "default", "night_temp=3750"),
-                mock.call("set", "--target", "bedtime", "day_temp=3750"),
-            ],
-        )
-        apply_active.assert_called_once_with()
+    def at(self, hour, minute=0):
+        return dt.datetime(2026, 9, 19, hour, minute, tzinfo=dt.timezone(dt.timedelta(hours=2)))
 
-    def test_rejects_unsafe_temperature(self):
-        with self.assertRaisesRegex(ValueError, "between 1000 and 10000"):
-            control.set_temperature("daylight", 999)
+    def test_daylight_phase(self):
+        result = control.schedule(self.settings(), self.at(12))
+        self.assertEqual((result["phase"], result["temperature"]), ("daylight", 6500))
 
-    def test_finds_temperature_in_nested_status(self):
-        value = {"backend": {"current_temp": 4123}}
-        self.assertEqual(control.find_number(value, {"temperature", "current_temp"}), 4123)
+    def test_smooth_sunset_transition(self):
+        result = control.schedule(self.settings(), self.at(19))
+        self.assertEqual(result["phase"], "sunset")
+        self.assertTrue(4000 < result["temperature"] < 6500)
+
+    def test_wind_down_reaches_bedtime_temperature(self):
+        result = control.schedule(self.settings(), self.at(22, 29))
+        self.assertEqual(result["phase"], "wind-down")
+        self.assertLess(result["temperature"], 3000)
+
+    def test_sleep_wraps_across_midnight(self):
+        self.assertEqual(control.schedule(self.settings(), self.at(2))["phase"], "sleep")
+
+    def test_manual_solar_location_is_plausible(self):
+        event = control.solar_event(dt.date(2026, 6, 21), 49.3961, 15.5912, True, 2)
+        self.assertIsNotNone(event)
+        self.assertGreater(event, 20 * 60)
+        self.assertLess(event, 22 * 60)
+
+    def test_rejects_invalid_time_and_location(self):
+        with self.assertRaisesRegex(ValueError, "HH:MM"):
+            control.validate_setting("wakeTime", "27:90")
+        with self.assertRaisesRegex(ValueError, "latitude"):
+            control.validate_setting("latitude", "120")
+
+    def test_fullscreen_and_app_exclusions_disable_filter(self):
+        values = self.settings()
+        values["disableFullscreen"] = True
+        window = {"class": "video", "title": "Movie", "fullscreen": True, "monitor": 0}
+        self.assertEqual(control.desired(values, self.at(12), window)["overrideReason"], "fullscreen")
+
+        values["disableFullscreen"] = False
+        values["excludedApps"] = ["firefox"]
+        window["class"] = "Firefox"
+        self.assertEqual(control.desired(values, self.at(12), window)["overrideReason"], "app: Firefox")
+
+    def test_wayland_output_name_maps_to_dbus_path(self):
+        self.assertEqual(control.relay_path("eDP-1"), "/outputs/eDP_1")
 
 
 if __name__ == "__main__":
